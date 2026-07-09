@@ -1345,7 +1345,14 @@ class HelpMenuPlugin(MaiBotPlugin):
             f"name={entry.get('plugin_name', '?')}, commands={cmd_count}"
         )
 
-        # Use plugin-provided descriptions as-is
+        # Use plugin-provided descriptions as-is.
+        # When description is empty, fall back to the command name
+        # (no hardcoded translations — just surface what the plugin already declared).
+        for cmd in raw_commands:
+            if not cmd.get("description", "").strip():
+                fallback = cmd.get("name", "") or cmd.get("trigger", "").lstrip("/")
+                if fallback:
+                    cmd["description"] = fallback
         enhanced_commands = raw_commands
 
         # Group commands that share the same trigger (e.g. avatar-meme
