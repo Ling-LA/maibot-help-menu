@@ -976,56 +976,6 @@ async def _get_or_generate_cached_image(
 # ═══════════════════════════════════════════════════════════════
 #  Command enhancement — English→Chinese translation
 # ═══════════════════════════════════════════════════════════════
-
-_CN_MAP: dict[str, str] = {
-    "create": "创建", "add": "添加", "list": "列表", "show": "查看",
-    "get": "获取", "set": "设置", "update": "更新", "delete": "删除",
-    "remove": "移除", "search": "搜索", "find": "查找", "query": "查询",
-    "config": "配置", "help": "帮助", "info": "信息", "status": "状态",
-    "start": "启动", "stop": "停止", "restart": "重启", "reset": "重置",
-    "on": "开启", "off": "关闭", "enable": "启用", "disable": "禁用",
-    "style": "风格", "model": "模型", "image": "图片", "generate": "生成",
-    "styles": "风格列表", "selfie": "自拍", "recall": "撤回",
-    "default": "默认", "standard": "标准", "mirror": "镜像", "photo": "拍照",
-}
-
-
-def _enhance_commands(commands: list[dict[str, str]]) -> list[dict[str, str]]:
-    """Add Chinese labels to commands where descriptions are English-only."""
-    enhanced: list[dict[str, str]] = []
-    for cmd in commands:
-        trigger = cmd.get("trigger", "")
-        desc = cmd.get("description", "")
-        name = cmd.get("name", "")
-        raw = trigger.lstrip("/")
-        cn_parts: list[str] = []
-        for word in raw.replace("_", " ").replace("-", " ").split():
-            low = word.lower()
-            if low in _CN_MAP:
-                cn_parts.append(_CN_MAP[low])
-            elif word.isascii() and not word.isdigit() and len(word) > 1:
-                cn_parts.append(word)
-        cn_label = " ".join(cn_parts) if cn_parts else ""
-        if not desc or desc.strip() == "":
-            enriched_desc = cn_label if cn_label else trigger
-        elif _is_english_only(desc) and cn_label:
-            enriched_desc = f"{cn_label} — {desc}"
-        else:
-            enriched_desc = desc
-        enhanced.append({
-            "trigger": trigger,
-            "description": enriched_desc,
-            "name": name,
-        })
-    return enhanced
-
-
-def _is_english_only(text: str) -> bool:
-    """Check if text contains only ASCII characters (no CJK)."""
-    return all(ord(ch) < 128 for ch in text if not ch.isspace())
-
-
-# ═══════════════════════════════════════════════════════════════
 #  Plugin class
 # ═══════════════════════════════════════════════════════════════
 
@@ -1385,8 +1335,8 @@ class HelpMenuPlugin(MaiBotPlugin):
             f"name={entry.get('plugin_name', '?')}, commands={cmd_count}"
         )
 
-        # Pre-process: add Chinese labels for English-only commands
-        enhanced_commands = _enhance_commands(raw_commands)
+        # Use plugin-provided descriptions as-is
+        enhanced_commands = raw_commands
 
         # Group commands that share the same trigger (e.g. avatar-meme
         # registers 6 commands all matching /表情).  Merge into grouped
