@@ -1353,6 +1353,19 @@ class HelpMenuPlugin(MaiBotPlugin):
         # Pre-process: add Chinese labels for English-only commands
         enhanced_commands = _enhance_commands(raw_commands)
 
+        # Deduplicate commands that share the same trigger (e.g. avatar-meme
+        # registers 6 commands all matching /表情). Keep one entry per trigger,
+        # preferring the one with the best description.
+        seen: set[str] = set()
+        deduped: list[dict[str, str]] = []
+        for cmd in enhanced_commands:
+            trig = cmd.get("trigger", "")
+            if not trig or trig in seen:
+                continue
+            seen.add(trig)
+            deduped.append(cmd)
+        enhanced_commands = deduped
+
         cache_key = f"menu_plugin_{plugin_id.replace('.', '_')}"
 
         # Strip internal 'name' from commands before sending to AI —
