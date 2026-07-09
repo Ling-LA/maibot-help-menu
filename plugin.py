@@ -322,15 +322,44 @@ async def _discover_commands(
             # Store basic info for later enrichment
             plugin_details[pid] = plugin
 
-    # ── enrich: use SDK get_plugin_info to fetch display name/description ──
+    # ── enrich: SDK get_plugin_info primary, _manifest.json fallback ──
     for pid in list(plugin_details.keys()):
         try:
             info = await ctx.component.get_plugin_info(pid)
-            if isinstance(info, dict):
+            if isinstance(info, dict) and info.get("name"):
                 plugin_details[pid]["_info"] = info
+                continue
         except Exception:
             pass
-    logger.info(f"[help-menu] fetched plugin info for {len(plugin_details)} plugins")
+
+    # Fallback: scan sibling directories for plugins still missing names.
+    # Only runs when SDK didn't provide a usable display name.
+    missing = {pid for pid, p in plugin_details.items()
+               if not (isinstance(p.get("_info"), dict) and p["_info"].get("name"))}
+    if missing:
+        plugins_root = PLUGIN_DIR.parent
+        if plugins_root.exists():
+            for entry in plugins_root.iterdir():
+                if not entry.is_dir():
+                    continue
+                mf_path = entry / "_manifest.json"
+                if not mf_path.exists():
+                    continue
+                try:
+                    mf = json.loads(mf_path.read_text(encoding="utf-8"))
+                    if isinstance(mf, dict):
+                        mf_pid = mf.get("id", "")
+                        if mf_pid in missing and mf.get("name"):
+                            plugin_details[mf_pid]["_info"] = mf
+                            missing.discard(mf_pid)
+                            if not missing:
+                                break
+                except Exception:
+                    pass
+            logger.info(
+                f"[help-menu] SDK enriched {len(plugin_details) - len(missing)}/"
+                f"{len(plugin_details)} plugins, manifest fallback for {len(missing)}"
+            )
 
     for plugin in plugins:
         if not isinstance(plugin, dict):
