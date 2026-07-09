@@ -505,7 +505,14 @@ _AI_PLUGIN_PROMPT = textwrap.dedent("""\
 ## 数据结构说明
 - name: 插件名称
 - description: 插件简介
-- commands: 命令列表，每个命令包含 trigger（命令触发词）和 description（命令说明）
+- commands: 命令列表，每项结构如下：
+  - trigger: 命令触发词
+  - description: 命令说明（单条命令时）
+  - subs: 可选，当一条 trigger 对应多个子功能时，列出所有子功能描述
+
+## 渲染要求
+- 如果 commands[i] 有 subs 字段，请用缩进或树形结构展示 trigger 及其下属的子功能列表
+- 如果 commands[i] 没有 subs 字段，正常展示 trigger + description
 
 ## 输出要求
 **只输出完整的 HTML 代码**（从 <!DOCTYPE html> 到 </html>），
@@ -774,17 +781,21 @@ def _build_plugin_menu_image(entry: dict[str, Any]) -> bytes | None:
     img_w = 480
 
     commands: list = entry.get("commands", [])
-    total = len(commands)
+    total = len(commands) + sum(len(cmd.get("subs", [])) - 1 for cmd in commands if cmd.get("subs"))
     avail_w = img_w - pad_x * 2 - 10
 
-    # Pre-calc row heights based on text content
+    # Pre-calc row heights based on text content (including subs)
     row_heights: list[int] = []
     for cmd in commands:
         trigger = cmd.get("trigger", "")
         desc = cmd.get("description", "")
+        subs = cmd.get("subs", [])
         trig_lines = _wrap_text(trigger, f_norm, avail_w)
         desc_lines = _wrap_text(desc, f_sm, avail_w) if desc else []
         total_lines = max(len(trig_lines), 1) + len(desc_lines)
+        if subs:
+            for sub in subs:
+                total_lines += len(_wrap_text(sub, f_xs, avail_w - 30)) or 1
         row_heights.append(max(row_h_min, total_lines * 16 + 14))
 
     if total == 0:
@@ -818,20 +829,40 @@ def _build_plugin_menu_image(entry: dict[str, Any]) -> bytes | None:
 
         trigger = cmd.get("trigger", "")
         desc_cmd = cmd.get("description", "")
+        subs = cmd.get("subs", [])
 
         trig_lines = _wrap_text(trigger, f_norm, avail_w - 15) if trigger else ["(无触发词)"]
         desc_lines = _wrap_text(desc_cmd, f_sm, avail_w - 15) if desc_cmd else []
 
         trig_text_h = len(trig_lines) * 17
         total_text_h = trig_text_h + len(desc_lines) * 14
+        if subs:
+            for sub in subs:
+                sub_lines = _wrap_text(sub, f_xs, avail_w - 30) or [sub]
+                total_text_h += len(sub_lines) * 13
         content_start = y + max((row_h - total_text_h) // 2, 4)
 
+        cur_text_y = content_start
         for li, line in enumerate(trig_lines):
-            draw.text((pad_x + 10, content_start + li * 17), line,
+            draw.text((pad_x + 10, cur_text_y), line,
                       fill=COLOR_TEXT_DARK, font=f_norm)
+            cur_text_y += 17
+
         for li, line in enumerate(desc_lines):
-            draw.text((pad_x + 10, content_start + trig_text_h + li * 15 + 2),
-                      line, fill=COLOR_TEXT_MID, font=f_xs)
+            draw.text((pad_x + 10, cur_text_y), line,
+                      fill=COLOR_TEXT_MID, font=f_xs)
+            cur_text_y += 15
+
+        # Render sub-features indented with tree-drawing chars
+        if subs:
+            for si, sub in enumerate(subs):
+                is_last = si == len(subs) - 1
+                prefix = "  └ " if is_last else "  ├ "
+                sub_lines = _wrap_text(sub, f_xs, avail_w - 30) or [sub]
+                for sli, sline in enumerate(sub_lines):
+                    draw.text((pad_x + 30, cur_text_y), prefix + sline if sli == 0 else "  │ " + sline,
+                              fill=COLOR_TEXT_MID, font=f_xs)
+                    cur_text_y += 13
 
         cur_y += row_h
 
@@ -1353,27 +1384,40 @@ class HelpMenuPlugin(MaiBotPlugin):
         # Pre-process: add Chinese labels for English-only commands
         enhanced_commands = _enhance_commands(raw_commands)
 
-        # Deduplicate commands that share the same trigger (e.g. avatar-meme
-        # registers 6 commands all matching /表情). Keep one entry per trigger,
-        # preferring the one with the best description.
-        seen: set[str] = set()
-        deduped: list[dict[str, str]] = []
+        # Group commands that share the same trigger (e.g. avatar-meme
+        # registers 6 commands all matching /表情).  Merge into grouped
+        # entries so every sub-feature is visible without repeating the trigger.
+        from collections import OrderedDict
+
+        trigger_groups: OrderedDict[str, list[dict]] = OrderedDict()
         for cmd in enhanced_commands:
             trig = cmd.get("trigger", "")
-            if not trig or trig in seen:
-                continue
-            seen.add(trig)
-            deduped.append(cmd)
-        enhanced_commands = deduped
+            if trig:
+                trigger_groups.setdefault(trig, []).append(cmd)
+
+        merged_commands: list[dict[str, Any]] = []
+        for trig, cmds in trigger_groups.items():
+            if len(cmds) == 1:
+                merged_commands.append(cmds[0])
+            else:
+                subs = [c.get("description", "") for c in cmds if c.get("description", "").strip()]
+                if not subs:
+                    subs = [c.get("name", "") for c in cmds if c.get("name", "").strip()]
+                merged_commands.append({
+                    "trigger": trig,
+                    "description": cmds[0].get("description", ""),
+                    "name": cmds[0].get("name", ""),
+                    "subs": subs,
+                })
 
         cache_key = f"menu_plugin_{plugin_id.replace('.', '_')}"
 
-        # Strip internal 'name' from commands before sending to AI —
-        # only trigger & description are relevant for the layout model.
-        ai_commands = [
-            {"trigger": c["trigger"], "description": c.get("description", "")}
-            for c in enhanced_commands
-        ]
+        ai_commands: list[dict[str, Any]] = []
+        for c in merged_commands:
+            item: dict[str, Any] = {"trigger": c["trigger"], "description": c.get("description", "")}
+            if c.get("subs"):
+                item["subs"] = c["subs"]
+            ai_commands.append(item)
 
         data = {
             "name": entry["plugin_name"],
@@ -1381,9 +1425,9 @@ class HelpMenuPlugin(MaiBotPlugin):
             "commands": ai_commands,
         }
 
-        # Also patch entry so PIL fallback sees enhanced commands
+        # Also patch entry so PIL fallback sees merged commands (with subs)
         enhanced_entry = dict(entry)
-        enhanced_entry["commands"] = enhanced_commands
+        enhanced_entry["commands"] = merged_commands
 
         result = await _get_or_generate_cached_image(
             self, stream_id, "plugin", cache_key,
