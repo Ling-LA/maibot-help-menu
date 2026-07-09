@@ -18,8 +18,6 @@ import base64
 import hashlib
 import io
 import json
-import math
-import os
 import re
 import textwrap
 import time
@@ -324,37 +322,15 @@ async def _discover_commands(
             # Store basic info for later enrichment
             plugin_details[pid] = plugin
 
-    # ── enrich: scan all plugin directories for _manifest.json ──
-    # (get_plugin_info API doesn't return manifest display name)
-    manifest_map: dict[str, dict] = {}
-    plugins_root = PLUGIN_DIR.parent
-    if plugins_root.exists():
-        for entry in plugins_root.iterdir():
-            if entry.is_dir():
-                mf_path = entry / "_manifest.json"
-                if mf_path.exists():
-                    try:
-                        with open(mf_path, "r", encoding="utf-8") as f:
-                            mf = json.load(f)
-                        if isinstance(mf, dict):
-                            pid_in_manifest = mf.get("id", "")
-                            if pid_in_manifest:
-                                manifest_map[pid_in_manifest] = mf
-                    except Exception:
-                        pass
-    logger.info(f"[help-menu] scanned {len(manifest_map)} plugin manifests")
-
-    for pid, p in plugin_details.items():
-        if pid in manifest_map:
-            p["_manifest"] = manifest_map[pid]
-
-    # Log first plugin keys for debugging
-    if plugin_details:
-        first = next(iter(plugin_details.values()))
-        logger.info(f"[help-menu debug] first plugin raw keys: {sorted(first.keys())}")
-        mf = first.get("_manifest", {})
-        if mf:
-            logger.info(f"[help-menu debug] first plugin _manifest.name={mf.get('name', '?')}")
+    # ── enrich: use SDK get_plugin_info to fetch display name/description ──
+    for pid in list(plugin_details.keys()):
+        try:
+            info = await ctx.component.get_plugin_info(pid)
+            if isinstance(info, dict):
+                plugin_details[pid]["_info"] = info
+        except Exception:
+            pass
+    logger.info(f"[help-menu] fetched plugin info for {len(plugin_details)} plugins")
 
     for plugin in plugins:
         if not isinstance(plugin, dict):
@@ -389,11 +365,10 @@ async def _discover_commands(
             continue  # skip plugins with no Command components
 
         # ── get display name ──
-        # _manifest is injected by the fetch_detail pass above.
-        mf = plugin.get("_manifest", {})
+        info = plugin.get("_info", {})
         pname = ""
-        if isinstance(mf, dict):
-            pname = mf.get("name", "").strip()
+        if isinstance(info, dict):
+            pname = info.get("name", "") or info.get("display_name", "")
         if not pname:
             pname = plugin.get("plugin_name", "") or plugin.get("display_name", "") or plugin.get("title", "")
         if not pname:
@@ -401,8 +376,8 @@ async def _discover_commands(
 
         # ── get description ──
         pdesc = ""
-        if isinstance(mf, dict):
-            pdesc = mf.get("description", "").strip()
+        if isinstance(info, dict):
+            pdesc = info.get("description", "") or info.get("introduction", "")
         if not pdesc:
             pdesc = plugin.get("_detail_description", "") or plugin.get("description", "")
 
