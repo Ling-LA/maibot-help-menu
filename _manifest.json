@@ -1,0 +1,41 @@
+{
+  "manifest_version": 2,
+  "id": "ling.help-menu",
+  "version": "1.0.1",
+  "name": "指令菜单 | Help Menu",
+  "description": "自动发现所有已启用插件的指令并生成分级图片菜单，支持AI辅助排版",
+  "author": {
+    "name": "Ling-LA",
+    "url": "https://github.com/Ling-LA"
+  },
+  "license": "MIT",
+  "urls": {
+    "repository": "https://github.com/Ling-LA/maibot-help-menu",
+    "homepage": "https://github.com/Ling-LA/maibot-help-menu",
+    "documentation": "https://github.com/Ling-LA/maibot-help-menu",
+    "issues": "https://github.com/Ling-LA/maibot-help-menu/issues"
+  },
+  "host_application": {
+    "min_version": "1.0.0",
+    "max_version": "1.99.99"
+  },
+  "sdk": {
+    "min_version": "2.0.0",
+    "max_version": "2.99.99"
+  },
+  "dependencies": [],
+  "capabilities": [
+    "send.text",
+    "send.image",
+    "config.get",
+    "component.get_all_plugins",
+    "component.get_plugin_info",
+    "render.html2png"
+  ],
+  "i18n": {
+    "default_locale": "zh-CN",
+    "supported_locales": [
+      "zh-CN"
+    ]
+  }
+}

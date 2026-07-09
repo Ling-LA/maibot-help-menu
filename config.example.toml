@@ -1,0 +1,15 @@
+[plugin]
+# 是否启用本插件
+enabled = true
+# 配置版本，请勿手动修改
+config_version = "1.0.0"
+# 是否启用 AI 辅助 HTML 布局（关闭后使用 Pillow 生成菜单）
+ai_layout_enabled = true
+# AI 模型名称（Bailian 平台）
+ai_model = "qwen-plus"
+# AI API 地址
+ai_api_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+# AI API 密钥（请替换为你自己的 Key）
+ai_api_key = "sk-your-api-key-here"
+# 菜单缓存有效期（分钟），过期后自动重新发现插件命令
+cache_ttl_minutes = 60
