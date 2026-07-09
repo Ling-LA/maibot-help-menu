@@ -327,15 +327,25 @@ async def _discover_commands(
         try:
             info = await ctx.component.get_plugin_info(pid)
             if isinstance(info, dict) and info.get("name"):
-                plugin_details[pid]["_info"] = info
-                continue
+                name = str(info["name"])
+                # Only trust the SDK name if it looks like a real display name
+                # (contains CJK, or doesn't look like a dotted plugin_id).
+                if re.search(r'[一-鿿]', name) or not re.match(r'^[\w.-]+$', name):
+                    plugin_details[pid]["_info"] = info
+                    continue
         except Exception:
             pass
 
     # Fallback: scan sibling directories for plugins still missing names.
     # Only runs when SDK didn't provide a usable display name.
-    missing = {pid for pid, p in plugin_details.items()
-               if not (isinstance(p.get("_info"), dict) and p["_info"].get("name"))}
+    def _has_display_name(p: dict) -> bool:
+        i = p.get("_info")
+        if not isinstance(i, dict):
+            return False
+        n = str(i.get("name", ""))
+        return bool(re.search(r'[一-鿿]', n) or not re.match(r'^[\w.-]+$', n))
+
+    missing = {pid for pid, p in plugin_details.items() if not _has_display_name(p)}
     if missing:
         plugins_root = PLUGIN_DIR.parent
         if plugins_root.exists():
