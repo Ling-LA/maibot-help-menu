@@ -2,7 +2,7 @@
 # 是否启用本插件
 enabled = true
 # 配置版本，请勿手动修改
-config_version = "1.0.0"
+config_version = "1.1.0"
 # 是否启用 AI 辅助 HTML 布局（关闭后使用 Pillow 生成菜单）
 ai_layout_enabled = true
 # AI 模型名称（Bailian 平台）

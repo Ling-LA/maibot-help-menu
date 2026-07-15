@@ -13,6 +13,11 @@ Commands:
 
 from __future__ import annotations
 
+from collections import OrderedDict
+from html import unescape
+from pathlib import Path
+from typing import Any
+
 import asyncio
 import base64
 import hashlib
@@ -21,8 +26,6 @@ import json
 import re
 import textwrap
 import time
-from pathlib import Path
-from typing import Any
 
 import aiohttp
 from maibot_sdk import Command, Field, MaiBotPlugin, PluginConfigBase
@@ -37,6 +40,7 @@ except ImportError:
 PLUGIN_DIR = Path(__file__).parent
 TEMP_DIR = PLUGIN_DIR / "temp"
 CACHE_FILE = PLUGIN_DIR / "menu_cache.json"
+CACHE_LAYOUT_VERSION = "2"
 
 PLUGIN_ID_SELF = "ling.help-menu"
 
@@ -81,7 +85,7 @@ class PluginSectionConfig(PluginConfigBase):
     __ui_order__ = 0
 
     enabled: bool = Field(default=True, description="启用插件")
-    config_version: str = Field(default="1.0.0", description="配置版本")
+    config_version: str = Field(default="1.1.0", description="配置版本")
     ai_layout_enabled: bool = Field(default=True, description="启用AI辅助布局")
     ai_model: str = Field(default="qwen-plus", description="AI模型名称")
     ai_api_url: str = Field(
@@ -158,121 +162,201 @@ def _plugin_id_hash(plugins: list[dict[str, Any]]) -> str:
     return hashlib.sha256("|".join(ids).encode()).hexdigest()
 
 
-def _extract_command_trigger(pattern: str) -> str:
-    """Extract a human-readable command trigger from a regex pattern.
+def _split_regex_alternatives(value: str) -> list[str]:
+    """拆分不含嵌套组的正则分支，保留转义后的竖线。"""
+    alternatives: list[str] = []
+    current: list[str] = []
+    depth = 0
+    escaped = False
+    for char in value:
+        if escaped:
+            current.extend(("\\", char))
+            escaped = False
+        elif char == "\\":
+            escaped = True
+        elif char == "(":
+            depth += 1
+            current.append(char)
+        elif char == ")":
+            depth = max(0, depth - 1)
+            current.append(char)
+        elif char == "|" and depth == 0:
+            alternatives.append("".join(current))
+            current = []
+        else:
+            current.append(char)
+    if escaped:
+        current.append("\\")
+    alternatives.append("".join(current))
+    return alternatives
 
-    Strategy: strip anchors and [/／] prefix, then collect literal characters
-    until we hit a regex construct or parameter boundary (@).
 
-    Examples:
-        r"^[/／]表情\\s+(?P<target>.+)$"        → "/表情"
-        r"禁言\\s*@(?P<target>\\S+)"          → "/禁言"
-        r"^/amind_create\\s*$"              → "/amind_create"
-        r"^[/／](帮助|菜单|help)\\s+(\\d+)"    → "/帮助"
-        r"^\\s*(?:\\[)*/dr(?:\\s+...)?$"  → "/dr"
-        r"^[/／]表情(?:包)?列表\\s*$"           → "/表情列表"
-    """
-    p = pattern.strip()
-
-    # ── 1. strip anchors ──
-    p = p.lstrip("^").rstrip("$")
-
-    # ── 2. strip [/／] or / or ／ leader ──
-    if p.startswith("[/") or p.startswith("[/"):
-        # handle character class like [/／]
-        p = re.sub(r"^\[[/／]\]\\?s?\\*?", "", p)
-    elif p.startswith("/"):
-        p = p[1:]
-    elif p.startswith("／"):
-        p = p[1:]
-
-    # ── 3. strip leading \\s* (whitespace noise) ──
-    p = re.sub(r"^\\[sS][*+?]?", "", p)
-    p = re.sub(r"^\\(?:\\\[\.\^\\[\]]*\\)[*+?]?$", "", p)  # complex prefix patterns
-
-    # ── 4. collect literal prefix ──
-    # Stop at: \ (regex escape), @ (parameter), ( (group), [ (char class),
-    #          *+?{} (quantifiers), .^$| (metachars)
-    result = ""
-    i = 0
-    n = len(p)
-    while i < n:
-        ch = p[i]
-
-        if ch == "\\":
-            # regex escape — we've entered regex territory, stop
-            # unless this is the very start of a complex pattern
-            if not result:
-                # No command found yet, this is likely a complex prefix
-                # Try to find a /command pattern
-                m = re.search(r"/([\w\u4e00-\u9fff-]+)", p)
-                if m:
-                    return "/" + m.group(1)[:30]
-            break
-
-        if ch == "@":
-            # Parameter boundary — stop
-            break
-
-        if ch == "(":
-            # Group — check if optional suffix like (?:包)?
-            # If we already have result and group is optional, skip it
-            check = p[i:]
-            if re.match(r"^\\(\?:\w+\\)[?]", check):
-                # Optional suffix after command — skip it, continue
-                j = p.find(")", i)
-                if j > i:
-                    i = j + 1
-                    while i < n and p[i] in "?*+":
-                        i += 1
-                    continue
-            break
-
-        if ch in "[{":
-            # Character class or quantifier — stop
-            break
-
-        if ch in "*+?" and result:
-            # Quantifier after command chars — skip but continue
-            i += 1
+def _find_group_end(pattern: str, start: int) -> int:
+    """返回正则分组的右括号位置，找不到时返回 -1。"""
+    depth = 0
+    escaped = False
+    in_class = False
+    for index in range(start, len(pattern)):
+        char = pattern[index]
+        if escaped:
+            escaped = False
             continue
+        if char == "\\":
+            escaped = True
+        elif char == "[":
+            in_class = True
+        elif char == "]":
+            in_class = False
+        elif not in_class and char == "(":
+            depth += 1
+        elif not in_class and char == ")":
+            depth -= 1
+            if depth == 0:
+                return index
+    return -1
 
-        if ch in ".^$|#~":
+
+def _literal_variants(expression: str) -> list[str]:
+    """展开命令头部的简单分支、字符类和可选字面量。"""
+    variants = [""]
+    index = 0
+    while index < len(expression):
+        char = expression[index]
+        if char == "\\":
+            if expression.startswith((r"\s", r"\S", r"\d", r"\w"), index):
+                break
+            if index + 1 < len(expression):
+                variants = [value + expression[index + 1] for value in variants]
+                index += 2
+                continue
             break
+        if char == "[":
+            end = expression.find("]", index + 1)
+            if end < 0:
+                break
+            choices = [item for item in expression[index + 1:end] if item not in "^-"]
+            if not choices:
+                break
+            variants = [value + choices[0].lower() for value in variants]
+            index = end + 1
+            continue
+        if char == "(":
+            end = _find_group_end(expression, index)
+            if end < 0:
+                break
+            content = expression[index + 1:end]
+            if content.startswith("?:"):
+                content = content[2:]
+            elif match := re.match(r"\?P<(?P<name>[A-Za-z_]\w*)>", content):
+                placeholder = f"<{match.group('name')}>"
+                variants = [value + placeholder for value in variants]
+                index = end + 1
+                continue
+            elif content.startswith("?"):
+                break
+            choices = _split_regex_alternatives(content)
+            literal_choices = [item for choice in choices for item in _literal_variants(choice)]
+            if not literal_choices:
+                break
+            quantifier = expression[end + 1] if end + 1 < len(expression) else ""
+            if quantifier in "?*":
+                literal_choices.insert(0, "")
+                end += 1
+            variants = [value + choice for value in variants for choice in literal_choices]
+            index = end + 1
+            continue
+        if char in " \\.^$|+*?{[@":
+            break
+        variants = [value + char for value in variants]
+        index += 1
+    return list(dict.fromkeys(value for value in variants if value))
 
-        # Collect literal character
-        result += ch
-        i += 1
 
-    if not result:
-        # Strip named-group prefixes like (?P<name> to avoid matching "P"
-        clean = re.sub(r"\(\?P<[^>]+>", "", p)
-        # Fallback 1: /word pattern (handles char-class e.g. /[Jj][Mm])
-        m = re.search(r"/((?:\[[^\]]+\]|[\w\u4e00-\u9fff-])+)", clean)
-        if m:
-            raw = m.group(1)
-            # Simplify character classes: pick first lowercase char from each
-            simplified = re.sub(
-                r"\[([^\]]+)\]",
-                lambda m2: m2.group(1)[0].lower(),
-                raw,
-            )
-            if simplified:
-                return "/" + simplified[:30]
-        # Fallback 2: prefer CJK (min 2 chars)
-        m = re.search(r"([\u4e00-\u9fff][\u4e00-\u9fff-]*)", clean)
-        if m and len(m.group(1)) >= 2:
-            return "/" + m.group(1)[:30]
-        # Fallback 3: English/word (min 2 chars)
-        m = re.search(r"([a-zA-Z_][\w-]*)", clean)
-        if m and len(m.group(1)) >= 2:
-            return "/" + m.group(1)[:30]
-        return "/?"
+def _parameter_suffix(pattern: str) -> str:
+    """从命令正则提取命名及未命名参数，生成必填/可选用法提示。"""
+    parameters: list[str] = []
+    named_spans: list[tuple[int, int]] = []
+    for match in re.finditer(r"\(\?P<(?P<name>[A-Za-z_]\w*)>", pattern):
+        name = match.group("name")
+        end = _find_group_end(pattern, match.start())
+        if end < 0:
+            continue
+        named_spans.append((match.start(), end))
+        prefix = pattern[max(0, match.start() - 16):match.start()]
+        optional = (end + 1 < len(pattern) and pattern[end + 1] in "?*") or bool(
+            re.search(r"\(\?:[^()]*$", prefix)
+        )
+        token = f"[{name}]" if optional else f"<{name}>"
+        if token not in parameters:
+            parameters.append(token)
 
-    result = result.strip()
-    if not result.startswith("/"):
-        result = "/" + result
-    return result[:30]
+    # 旧式插件常用未命名捕获组声明参数。仅处理首个空白匹配之后的叶子组，
+    # 避免把命令头部的 `(帮助|菜单)` 之类分支误当作参数。
+    parameter_zone = pattern.find(r"\s")
+    generic_index = 0
+    for match in re.finditer(r"(?<!\\)\((?!\?)", pattern):
+        if parameter_zone < 0 or match.start() < parameter_zone:
+            continue
+        end = _find_group_end(pattern, match.start())
+        if end < 0 or any(start <= match.start() <= span_end for start, span_end in named_spans):
+            continue
+        content = pattern[match.start() + 1:end]
+        if re.search(r"(?<!\\)\((?!\?)", content):
+            continue
+        generic_index += 1
+        label = f"参数{generic_index}"
+        prefix = pattern[max(0, match.start() - 16):match.start()]
+        optional = (end + 1 < len(pattern) and pattern[end + 1] in "?*") or bool(
+            re.search(r"\(\?:[^()]*$", prefix)
+        )
+        token = f"[{label}]" if optional else f"<{label}>"
+        parameters.append(token)
+    return " " + " ".join(parameters) if parameters else ""
+
+
+def _extract_command_usages(pattern: str, aliases: Any = None) -> list[str]:
+    """从 Command 正则和 aliases 提取完整、稳定且去重后的命令用法。"""
+    expression = str(pattern or "").strip().lstrip("^")
+    expression = re.sub(r"^\\s[*+?]?", "", expression)
+    expression = re.sub(r"^\(\?:\^\|\.\*\)", "", expression)
+    has_slash = False
+    slash_match = re.match(r"(?:\[/／\]|\[／/\]|[/／])", expression)
+    if slash_match:
+        has_slash = True
+        expression = expression[slash_match.end():]
+    else:
+        embedded_matches = list(re.finditer(r"/(?![?*+])(?=[\w\u4e00-\u9fff])", expression))
+        embedded = embedded_matches[-1] if embedded_matches else None
+        if embedded:
+            has_slash = True
+            expression = expression[embedded.end():]
+
+    suffix = _parameter_suffix(expression)
+    usages: list[str] = []
+    for head in _literal_variants(expression):
+        head_suffix = suffix
+        for placeholder in re.findall(r"<([A-Za-z_]\w*)>", head):
+            head_suffix = head_suffix.replace(f" <{placeholder}>", "").replace(f" [{placeholder}]", "")
+        usages.append(("/" if has_slash else "") + head + head_suffix)
+    alias_values = aliases if isinstance(aliases, list) else []
+    for alias in alias_values:
+        value = str(alias or "").strip()
+        if value and has_slash and not value.startswith(("/", "／")):
+            value = "/" + value
+        if value:
+            usages.append(value)
+
+    normalized: list[str] = []
+    for usage in usages:
+        value = re.sub(r"\s+", " ", usage).strip().replace("／", "/")
+        if value and value not in normalized:
+            normalized.append(value[:80])
+    return normalized or [f"/{str(pattern or '?')[:30]}"]
+
+
+def _extract_command_trigger(pattern: str) -> str:
+    """兼容旧调用：返回正则解析出的第一条命令用法。"""
+    return _extract_command_usages(pattern)[0]
 
 
 async def _discover_commands(
@@ -383,21 +467,33 @@ async def _discover_commands(
             continue
 
         commands: list[dict[str, Any]] = []
+        seen_commands: set[tuple[str, tuple[str, ...]]] = set()
         for comp in components:
             if not isinstance(comp, dict):
                 continue
             if comp.get("type", "").upper() != "COMMAND":
                 continue
+            if comp.get("enabled") is False:
+                continue
             meta = comp.get("metadata", {})
             if not isinstance(meta, dict):
                 continue
-            pattern = meta.get("command_pattern", "")
-            desc = meta.get("description", "")
-            trig = _extract_command_trigger(pattern) if pattern else f"/{comp.get('name', '?')}"
+            pattern = str(meta.get("command_pattern") or "")
+            aliases = meta.get("aliases", [])
+            usages = (
+                _extract_command_usages(pattern, aliases)
+                if pattern
+                else _extract_command_usages(f"/{comp.get('name', '?')}", aliases)
+            )
+            command_key = (str(comp.get("name") or "?"), tuple(usages))
+            if command_key in seen_commands:
+                continue
+            seen_commands.add(command_key)
             commands.append({
                 "name": comp.get("name", "?"),
-                "trigger": trig,
-                "description": desc or "",
+                "trigger": usages[0],
+                "usages": usages,
+                "description": str(meta.get("description") or ""),
             })
 
         if not commands:
@@ -478,16 +574,26 @@ async def _refresh_menu_tree(
 #  Image generation — AI (Bailian → HTML → render.html2png)
 # ═══════════════════════════════════════════════════════════════
 
+_AI_SHARED_RULES = """
+## 统一设计规范（不得自由更换风格）
+1. 页面根节点必须是 `<main class="menu-shell">`，固定宽度 480px，box-sizing: border-box。
+2. body 必须 margin: 0，背景色 #fff5fa；menu-shell 内边距 16px，字体仅使用 Microsoft YaHei、PingFang SC、sans-serif。
+3. 顶部必须使用 `<header class="menu-header">`，粉色渐变 #ff7eb3 到 #ffa0c8，圆角 16px，白色标题。
+4. 内容只能使用 `<section class="menu-list">` 和 `<article class="menu-card">`；卡片白底、1px #f3cfdd 边框、12px 圆角、12px 内边距、8px 间距，禁止交替更换颜色。
+5. 命令文本必须使用 `<code class="command-usage">`；说明使用 `<p class="item-description">`。所有页面字号、间距、圆角和颜色必须一致。
+6. 不得新增、改写、翻译、合并或遗漏 JSON 中的任何条目；严格保持输入顺序。空说明不要虚构内容。
+7. 禁止表格、绝对定位、外部资源、JavaScript、动画和横向滚动。
+8. 页面底部统一显示“发送 /帮助 返回主菜单”。
+"""
+
+
 _AI_MAIN_PROMPT = textwrap.dedent("""\
-你是一个优秀的 UI 设计师。请根据下面的菜单数据生成一个美观的 **HTML 页面代码**。
+请严格按照统一设计规范，把下面的菜单数据渲染为完整 HTML。
 
 ## 硬性约束
 1. **只使用内联 CSS**，禁止任何外部资源引用（不要 link、不要 @import、不要 CDN）
-2. 粉色系主题，主色 #ff7eb3，辅色 #ffb6c1
-3. 响应式设计：在手机（360-768px）和桌面（>768px）上都好看
-4. 使用 Emoji 作为装饰图标
-5. 字体族: "Microsoft YaHei", "PingFang SC", sans-serif
-6. body 宽度固定为 480px，方便截图
+2. 每个插件必须单独使用一张 menu-card，显示 index、plugin_name、description 和 command_count
+3. 不允许自行增删文字或改变插件顺序
 
 ## 菜单数据（JSON）
 {data}
@@ -497,21 +603,21 @@ _AI_MAIN_PROMPT = textwrap.dedent("""\
 - index: 菜单序号
 - plugin_name: 插件名称
 - description: 插件简介
+- command_count: Command 组件数量
 
 ## 输出要求
 **只输出完整的 HTML 代码**（从 <!DOCTYPE html> 到 </html>），
-**不要**包含任何解释、说明、markdown 代码块标记。""")
+**不要**包含任何解释、说明、markdown 代码块标记。
+""") + _AI_SHARED_RULES
 
 _AI_PLUGIN_PROMPT = textwrap.dedent("""\
-你是一个优秀的 UI 设计师。请根据下面的插件命令数据生成一个美观的 **HTML 页面代码**。
+请严格按照统一设计规范，把下面的插件命令数据渲染为完整 HTML。
 
 ## 硬性约束
 1. **只使用内联 CSS**，禁止任何外部资源引用（不要 link、不要 @import、不要 CDN）
-2. 粉色系主题，主色 #ff7eb3，辅色 #ffb6c1
-3. 响应式设计：在手机（360-768px）和桌面（>768px）上都好看
-4. 使用 Emoji 作为装饰图标
-5. 字体族: "Microsoft YaHei", "PingFang SC", sans-serif
-6. body 宽度固定为 480px，方便截图
+2. 每条 commands 必须单独使用一张 menu-card
+3. trigger 必须完整原样显示，禁止省略其中任何别名或参数
+4. subs 必须按原顺序全部显示在对应卡片中
 
 ## 插件数据（JSON）
 {data}
@@ -530,7 +636,8 @@ _AI_PLUGIN_PROMPT = textwrap.dedent("""\
 
 ## 输出要求
 **只输出完整的 HTML 代码**（从 <!DOCTYPE html> 到 </html>），
-**不要**包含任何解释、说明、markdown 代码块标记。""")
+**不要**包含任何解释、说明、markdown 代码块标记。
+""") + _AI_SHARED_RULES
 
 
 def _extract_html(raw: str) -> str:
@@ -547,6 +654,23 @@ def _extract_html(raw: str) -> str:
     if m:
         return m.group(1).strip()
     return raw.strip()
+
+
+def _validate_ai_html(html: str, menu_type: str, data: dict[str, Any]) -> bool:
+    """检查 AI 是否采用统一骨架并完整保留菜单关键字段。"""
+    lowered = html.casefold()
+    if "menu-shell" not in lowered or "menu-header" not in lowered or "menu-card" not in lowered:
+        return False
+    plain_text = unescape(re.sub(r"<[^>]+>", " ", html))
+    required: list[str] = []
+    if menu_type == "main":
+        required.extend(str(item.get("plugin_name") or "") for item in data.get("plugins", []))
+    else:
+        required.append(str(data.get("name") or ""))
+        for command in data.get("commands", []):
+            required.append(str(command.get("trigger") or ""))
+            required.extend(str(item or "") for item in command.get("subs", []))
+    return all(not value or value in plain_text for value in required)
 
 
 async def _ai_generate_html(
@@ -579,7 +703,7 @@ async def _ai_generate_html(
         "messages": [
             {"role": "user", "content": prompt},
         ],
-        "temperature": 0.7,
+        "temperature": 0.0,
         "max_tokens": 4096,
     }
 
@@ -608,7 +732,11 @@ async def _ai_generate_html(
         plugin.ctx.logger.warning(f"Bailian 响应格式异常: {exc}")
         return None
 
-    return _extract_html(str(content))
+    html = _extract_html(str(content))
+    if not _validate_ai_html(html, _type, data):
+        plugin.ctx.logger.warning("Bailian 返回的菜单未满足统一布局或内容完整性要求，改用 Pillow 布局")
+        return None
+    return html
 
 
 async def _render_html_to_image(
@@ -857,12 +985,12 @@ def _build_plugin_menu_image(entry: dict[str, Any]) -> bytes | None:
         content_start = y + max((row_h - total_text_h) // 2, 4)
 
         cur_text_y = content_start
-        for li, line in enumerate(trig_lines):
+        for line in trig_lines:
             draw.text((pad_x + 10, cur_text_y), line,
                       fill=COLOR_TEXT_DARK, font=f_norm)
             cur_text_y += 17
 
-        for li, line in enumerate(desc_lines):
+        for line in desc_lines:
             draw.text((pad_x + 10, cur_text_y), line,
                       fill=COLOR_TEXT_MID, font=f_xs)
             cur_text_y += 15
@@ -943,7 +1071,10 @@ async def _get_or_generate_cached_image(
                   Must include 'plugin_name', 'description', 'commands', 'index'.
     """
     TEMP_DIR.mkdir(parents=True, exist_ok=True)
-    cache_path = TEMP_DIR / f"{cache_key}.png"
+    data_hash = hashlib.sha256(
+        json.dumps(data, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    ).hexdigest()[:12]
+    cache_path = TEMP_DIR / f"{cache_key}_{data_hash}.png"
 
     # Check cache
     if cache_path.exists():
@@ -988,6 +1119,48 @@ async def _get_or_generate_cached_image(
 # ═══════════════════════════════════════════════════════════════
 #  Plugin class
 # ═══════════════════════════════════════════════════════════════
+
+
+def _normalize_menu_lookup(value: Any) -> str:
+    """统一菜单直达查询文本，忽略全角斜杠、大小写和多余空白。"""
+    return re.sub(r"\s+", " ", str(value or "").strip().replace("／", "/")).casefold()
+
+
+def _entry_search_terms(entry: dict[str, Any]) -> set[str]:
+    """收集插件名称、ID、命令完整用法和命令头部作为精确匹配项。"""
+    terms = {
+        _normalize_menu_lookup(entry.get("plugin_id")),
+        _normalize_menu_lookup(entry.get("plugin_name")),
+    }
+    for command in entry.get("commands", []):
+        usages = command.get("usages") or [command.get("trigger", "")]
+        for usage in usages:
+            normalized = _normalize_menu_lookup(usage)
+            if normalized:
+                terms.add(normalized)
+                terms.add(normalized.split(" ", 1)[0])
+    return {term for term in terms if term}
+
+
+def _find_menu_entry(tree: list[dict[str, Any]], query: str) -> dict[str, Any] | None:
+    """优先精确匹配；只有前缀唯一时才接受缩写，避免命令误归属。"""
+    normalized = _normalize_menu_lookup(query)
+    query_terms = {normalized, normalized.lstrip("/")}
+    candidates = [(entry, _entry_search_terms(entry)) for entry in tree]
+    exact = [entry for entry, terms in candidates if query_terms & terms]
+    if len(exact) == 1:
+        return exact[0]
+
+    if len(normalized.lstrip("/")) < 2:
+        return None
+    prefix = [
+        entry
+        for entry, terms in candidates
+        if any(term.startswith(query_term) for term in terms for query_term in query_terms)
+    ]
+    unique = {str(entry.get("plugin_id")): entry for entry in prefix}
+    return next(iter(unique.values())) if len(unique) == 1 else None
+
 
 class HelpMenuPlugin(MaiBotPlugin):
     """🌸 指令菜单 | 自动发现插件命令并生成分级图片菜单"""
@@ -1096,7 +1269,7 @@ class HelpMenuPlugin(MaiBotPlugin):
             })
 
         result = await _get_or_generate_cached_image(
-            self, stream_id, "main", "menu_main",
+            self, stream_id, "main", f"v{CACHE_LAYOUT_VERSION}_menu_main",
             data={"plugins": main_data, "total": len(main_data)},
             pil_tree=tree,
         )
@@ -1171,27 +1344,7 @@ class HelpMenuPlugin(MaiBotPlugin):
 
         tree = await self._ensure_tree_fresh()
 
-        # Try exact trigger match first, then prefix match
-        entry = None
-        for e in tree:
-            for cmd in e.get("commands", []):
-                cmd_trigger = cmd.get("trigger", "")
-                if cmd_trigger == trigger or cmd_trigger.startswith(trigger):
-                    entry = e
-                    break
-            if entry:
-                break
-
-        if entry is None:
-            # Try partial match
-            for e in tree:
-                for cmd in e.get("commands", []):
-                    cmd_trigger = cmd.get("trigger", "")
-                    if trigger in cmd_trigger or cmd_trigger.lstrip("/") in trigger:
-                        entry = e
-                        break
-                if entry:
-                    break
+        entry = _find_menu_entry(tree, trigger)
 
         if entry is None:
             await self.ctx.send.text(
@@ -1299,25 +1452,7 @@ class HelpMenuPlugin(MaiBotPlugin):
             trigger = "/" + trigger
 
         tree = await self._ensure_tree_fresh()
-        entry = None
-        for e in tree:
-            for cmd in e.get("commands", []):
-                cmd_trigger = cmd.get("trigger", "")
-                if cmd_trigger == trigger or cmd_trigger.startswith(trigger):
-                    entry = e
-                    break
-            if entry:
-                break
-
-        if entry is None:
-            for e in tree:
-                for cmd in e.get("commands", []):
-                    cmd_trigger = cmd.get("trigger", "")
-                    if trigger in cmd_trigger or cmd_trigger.lstrip("/") in trigger:
-                        entry = e
-                        break
-                if entry:
-                    break
+        entry = _find_menu_entry(tree, trigger)
 
         if entry is None:
             await self.ctx.send.text(
@@ -1355,33 +1490,34 @@ class HelpMenuPlugin(MaiBotPlugin):
                     cmd["description"] = fallback
         enhanced_commands = raw_commands
 
-        # Group commands that share the same trigger (e.g. avatar-meme
+        # Group commands that share the same complete usage set (e.g. avatar-meme
         # registers 6 commands all matching /表情).  Merge into grouped
         # entries so every sub-feature is visible without repeating the trigger.
-        from collections import OrderedDict
-
-        trigger_groups: OrderedDict[str, list[dict]] = OrderedDict()
+        trigger_groups: OrderedDict[tuple[str, ...], list[dict[str, Any]]] = OrderedDict()
         for cmd in enhanced_commands:
-            trig = cmd.get("trigger", "")
-            if trig:
-                trigger_groups.setdefault(trig, []).append(cmd)
+            usages = tuple(cmd.get("usages") or [cmd.get("trigger", "")])
+            if any(usages):
+                trigger_groups.setdefault(usages, []).append(cmd)
 
         merged_commands: list[dict[str, Any]] = []
-        for trig, cmds in trigger_groups.items():
+        for usages, cmds in trigger_groups.items():
             if len(cmds) == 1:
-                merged_commands.append(cmds[0])
+                command = dict(cmds[0])
+                command["trigger"] = " ｜ ".join(usages)
+                merged_commands.append(command)
             else:
                 subs = [c.get("description", "") for c in cmds if c.get("description", "").strip()]
                 if not subs:
                     subs = [c.get("name", "") for c in cmds if c.get("name", "").strip()]
                 merged_commands.append({
-                    "trigger": trig,
+                    "trigger": " ｜ ".join(usages),
+                    "usages": list(usages),
                     "description": cmds[0].get("description", ""),
                     "name": cmds[0].get("name", ""),
                     "subs": subs,
                 })
 
-        cache_key = f"menu_plugin_{plugin_id.replace('.', '_')}"
+        cache_key = f"v{CACHE_LAYOUT_VERSION}_menu_plugin_{plugin_id.replace('.', '_')}"
 
         ai_commands: list[dict[str, Any]] = []
         for c in merged_commands:

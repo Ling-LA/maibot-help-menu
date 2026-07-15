@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "id": "ling.help-menu",
-  "version": "1.0.1",
+  "version": "1.1.0",
   "name": "指令菜单 | Help Menu",
   "description": "自动发现所有已启用插件的指令并生成分级图片菜单，支持AI辅助排版",
   "author": {
